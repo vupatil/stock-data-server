@@ -14,7 +14,7 @@ const { initDB, getDB, closeDB } = require('./config/database');
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 3002;
+const PORT = process.env.PORT || 3001;
 
 // ===== MIDDLEWARE =====
 
@@ -23,23 +23,7 @@ app.use(helmet({
 }));
 
 app.use(cors({
-  origin: function (origin, callback) {
-    const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || [
-      'http://localhost:3000',
-      'http://localhost:3001',
-      'http://localhost:5173',
-      'http://localhost:5174',
-      'http://localhost:5175',
-      'http://localhost:5176'
-    ];
-    // Allow requests with no origin (like mobile apps or curl)
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      callback(null, true); // Allow all origins in development
-    }
-  },
+  origin: true, // Accept all origins
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
@@ -47,13 +31,13 @@ app.use(cors({
 
 app.use(express.json());
 
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 1000,
-  message: 'Too many requests, please try again later.'
-});
-
-app.use(limiter);
+// Rate limiting disabled
+// const limiter = rateLimit({
+//   windowMs: 15 * 60 * 1000,
+//   max: 10000,
+//   message: 'Too many requests, please try again later.'
+// });
+// app.use(limiter);
 
 // ===== CONFIGURATION =====
 
@@ -241,20 +225,23 @@ async function fetchFromMySQL(symbol, intervalParam, includeExtended = false) {
   }
 }
 
-async function fetchFromAlpaca(symbol, range, includeExtended = false) {
-  const interval = getIntervalFromRange(range);
-  const { start, end } = getTimeRangeFromRange(range);
+async function fetchFromAlpaca(symbol, intervalParam, includeExtended = false) {
+  const interval = normalizeInterval(intervalParam);
+  const { start, end } = getTimeRangeForInterval(intervalParam);
   
   // Map interval to Alpaca timeframe
   const timeframeMap = {
     '1m': '1Min',
+    '2m': '2Min',
     '5m': '5Min',
     '15m': '15Min',
     '30m': '30Min',
     '1h': '1Hour',
+    '2h': '2Hour',
     '4h': '4Hour',
     '1d': '1Day',
-    '1w': '1Week'
+    '1w': '1Week',
+    '1mo': '1Month'
   };
   
   try {
@@ -322,10 +309,11 @@ async function fetchFromAlpaca(symbol, range, includeExtended = false) {
         source: 'alpaca',
         companyName: symbol,
         requestedInterval: interval,
-        appliedRange: range
+        appliedRange: intervalParam
       }
     };
   } catch (error) {
+    console.log(`  ⚠️  Alpaca error: ${error.message}`);
     throw error;
   }
 }
@@ -378,27 +366,60 @@ async function validateAndAddSymbol(symbol) {
     
     console.log(`  ✅ Added new symbol: ${symbol} (stock_id: ${result.insertId})`);
     
-    // Fetch initial data for common intervals (using date range for better results)
-    const intervals = ['1d'];
-    const endDate = new Date();
-    const startDate = new Date();
-    startDate.setFullYear(startDate.getFullYear() - 3); // Get 3 years of data (~600 trading days)
+    // Fetch initial data for multiple intervals
+    const intervals = ['1m', '5m', '15m', '1h', '1d'];
+    
+    // Get last market close time (4 PM ET on last trading day)
+    const now = new Date();
+    let endDate = new Date(now);
+    
+    // Simple logic: if it's after 4 PM ET today (weekday), use today; otherwise use previous trading day
+    const etTimeString = now.toLocaleString('en-US', { timeZone: 'America/New_York' });
+    const etNow = new Date(etTimeString);
+    const etDay = etNow.getDay(); // 0=Sunday, 6=Saturday
+    const etHour = etNow.getHours();
+    
+    // If weekend, go back to Friday
+    if (etDay === 0) { // Sunday
+      endDate.setDate(endDate.getDate() - 2);
+    } else if (etDay === 6) { // Saturday
+      endDate.setDate(endDate.getDate() - 1);
+    } else if (etDay === 1 && etHour < 16) { // Monday before 4 PM - use Friday
+      endDate.setDate(endDate.getDate() - 3);
+    } else if (etHour < 16) { // Weekday before 4 PM - use previous day
+      endDate.setDate(endDate.getDate() - 1);
+    }
     
     for (const interval of intervals) {
       try {
-        const timeframe = interval === '1d' ? '1Day' : interval === '1w' ? '1Week' : '1Month';
+        const timeframeMap = {
+          '1m': { tf: '1Min', days: 1 },
+          '5m': { tf: '5Min', days: 5 },
+          '15m': { tf: '15Min', days: 30 },
+          '1h': { tf: '1Hour', days: 90 },
+          '1d': { tf: '1Day', days: 1095 } // 3 years
+        };
+        
+        const config = timeframeMap[interval];
+        if (!config) continue;
+        
+        const startDate = new Date();
+        startDate.setDate(startDate.getDate() - config.days);
+        
         const histResponse = await axios.get(
           `${ALPACA_CONFIG.baseURL}/v2/stocks/bars`,
           {
             headers: ALPACA_CONFIG.headers,
             params: {
               symbols: symbol,
-              timeframe,
-              start: startDate.toISOString().split('T')[0],
-              end: endDate.toISOString().split('T')[0],
+              timeframe: config.tf,
+              start: startDate.toISOString(),
+              end: endDate.toISOString(),
               adjustment: 'split',
-              feed: 'iex'
-            }
+              feed: 'iex',
+              limit: 10000
+            },
+            timeout: 10000
           }
         );
         
@@ -503,7 +524,8 @@ app.get('/api/stock/:symbol', async (req, res) => {
               console.log(`  ✓ MySQL: ${data.chart.result[0].timestamp.length} bars`);
               return res.json(data);
             } catch (retryError) {
-              // If MySQL still fails, try Alpaca
+              // If MySQL still fails after auto-add, try Alpaca as last resort
+              console.log(`  ✗ MySQL retry failed: ${retryError.message}`);
               console.log(`  ℹ️  Falling back to Alpaca...`);
             }
           }
@@ -531,22 +553,16 @@ app.get('/api/stock/:symbol', async (req, res) => {
       } catch (alpacaError) {
         console.log(`  ✗ Alpaca: ${alpacaError.message}`);
         
-        // If Alpaca says no data found, it's likely an invalid/delisted symbol
-        if (alpacaError.message.includes('No data returned') || 
-            alpacaError.message.includes('No bars found') || 
-            alpacaError.message.includes('not found')) {
-          return res.status(404).json({
-            chart: {
-              result: null,
-              error: {
-                code: 'symbol_not_found',
-                description: `Symbol '${upperSymbol}' not found or no data available`
-              }
+        // Return error with clear message
+        return res.status(404).json({
+          chart: {
+            result: null,
+            error: {
+              code: 'no_data',
+              description: `No data available for ${upperSymbol} with interval ${interval}`
             }
-          });
-        }
-        
-        throw new Error('No data available from any source');
+          }
+        });
       }
     }
   } catch (error) {

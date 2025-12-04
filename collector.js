@@ -265,10 +265,35 @@ async function cleanupOldData(symbol, intervalName) {
 
 // ===== COLLECTION JOBS =====
 
+function isMarketHours() {
+  const now = new Date();
+  const etNow = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const day = etNow.getDay(); // 0=Sunday, 6=Saturday
+  const hour = etNow.getHours();
+  const minute = etNow.getMinutes();
+  
+  // Market hours: Monday-Friday, 9:30 AM - 4:00 PM ET
+  if (day === 0 || day === 6) return false; // Weekend
+  
+  const timeInMinutes = hour * 60 + minute;
+  const marketOpen = 9 * 60 + 30; // 9:30 AM
+  const marketClose = 16 * 60; // 4:00 PM
+  
+  return timeInMinutes >= marketOpen && timeInMinutes <= marketClose;
+}
+
 async function collectInterval(intervalConfig) {
   const logId = await startLog(`collect_${intervalConfig.name}`, intervalConfig.name, SYMBOLS.length);
   
   try {
+    // Skip intraday collection outside market hours
+    const intradayIntervals = ['1m', '2m', '5m', '15m', '30m', '1h', '2h', '4h'];
+    if (intradayIntervals.includes(intervalConfig.name) && !isMarketHours()) {
+      console.log(`\n⏸️  [${new Date().toLocaleTimeString()}] Skipping ${intervalConfig.name} collection (market closed)`);
+      await completeLog(logId, 'skipped', 0, 0, 0, 'Market closed');
+      return 0;
+    }
+    
     console.log(`\n📥 [${new Date().toLocaleTimeString()}] Collecting ${intervalConfig.name} bars...`);
     
     // Fetch last few periods to ensure we don't miss any
