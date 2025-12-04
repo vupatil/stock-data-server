@@ -1,0 +1,396 @@
+/**
+ * STOCK DATA COLLECTOR
+ * 
+ * Fetches real-time stock data from Alpaca API and stores in MySQL
+ * Runs continuously, collecting 1-minute bars for all configured symbols
+ */
+
+const axios = require('axios');
+const cron = require('node-cron');
+const { initDB, getDB, closeDB } = require('./config/database');
+require('dotenv').config();
+
+// ===== CONFIGURATION =====
+
+const ALPACA_CONFIG = {
+  baseURL: process.env.ALPACA_BASE_URL || 'https://data.alpaca.markets',
+  headers: {
+    'APCA-API-KEY-ID': process.env.ALPACA_API_KEY,
+    'APCA-API-SECRET-KEY': process.env.ALPACA_API_SECRET
+  }
+};
+
+const SYMBOLS = process.env.STOCK_SYMBOLS 
+  ? process.env.STOCK_SYMBOLS.split(',').map(s => s.trim())
+  : ['AAPL', 'TSLA', 'MSFT', 'GOOGL', 'AMZN'];
+
+const COLLECTION_ENABLED = process.env.COLLECTION_ENABLED !== 'false';
+const BACKFILL_DAYS = parseInt(process.env.BACKFILL_DAYS) || 7;
+
+console.log(`\n📊 Collector configured for ${SYMBOLS.length} symbols`);
+
+// ===== HELPER FUNCTIONS =====
+
+async function getStockId(symbol) {
+  const db = getDB();
+  const [rows] = await db.query(
+    'SELECT stock_id FROM stocks WHERE symbol = ?',
+    [symbol]
+  );
+  
+  if (rows.length === 0) {
+    const [result] = await db.query(
+      'INSERT INTO stocks (symbol) VALUES (?) ON DUPLICATE KEY UPDATE stock_id=LAST_INSERT_ID(stock_id)',
+      [symbol]
+    );
+    return result.insertId;
+  }
+  
+  return rows[0].stock_id;
+}
+
+async function startLog(jobType, intervalType, symbolsRequested) {
+  const db = getDB();
+  const [result] = await db.query(
+    'INSERT INTO data_collection_log (job_type, interval_type, symbols_requested, status, started_at) VALUES (?, ?, ?, ?, NOW())',
+    [jobType, intervalType, symbolsRequested, 'running']
+  );
+  return result.insertId;
+}
+
+async function completeLog(logId, status, symbolsProcessed, recordsInserted, recordsUpdated, errorMessage = null) {
+  const db = getDB();
+  await db.query(
+    `UPDATE data_collection_log 
+     SET status = ?, symbols_processed = ?, records_inserted = ?, records_updated = ?, 
+         completed_at = NOW(), duration_ms = TIMESTAMPDIFF(MICROSECOND, started_at, NOW()) / 1000, 
+         error_message = ?
+     WHERE log_id = ?`,
+    [status, symbolsProcessed, recordsInserted, recordsUpdated, errorMessage, logId]
+  );
+}
+
+// ===== ALPACA API FUNCTIONS =====
+
+async function fetchAlpacaBars(symbols, start, end, timeframe = '1Min') {
+  try {
+    const response = await axios.get('/v2/stocks/bars', {
+      baseURL: ALPACA_CONFIG.baseURL,
+      headers: ALPACA_CONFIG.headers,
+      params: {
+        symbols: symbols.join(','),
+        timeframe: timeframe,
+        start: start.toISOString(),
+        end: end.toISOString(),
+        limit: 10000,
+        adjustment: 'split',
+        feed: 'iex'
+      },
+      timeout: 30000
+    });
+
+    return response.data.bars || {};
+  } catch (error) {
+    console.error('❌ Alpaca API error:', error.response?.data || error.message);
+    throw error;
+  }
+}
+
+// ===== DATA STORAGE =====
+
+async function store1mBars(barsData) {
+  const db = getDB();
+  let totalInserted = 0;
+  
+  for (const [symbol, bars] of Object.entries(barsData)) {
+    if (!bars || bars.length === 0) continue;
+    
+    const stockId = await getStockId(symbol);
+    
+    const values = bars.map(bar => [
+      stockId,
+      '1m',
+      Math.floor(new Date(bar.t).getTime() / 1000),
+      parseFloat(bar.o),
+      parseFloat(bar.h),
+      parseFloat(bar.l),
+      parseFloat(bar.c),
+      parseInt(bar.v) || 0,
+      parseFloat(bar.vw) || null,
+      parseInt(bar.n) || null,
+      'alpaca'
+    ]);
+    
+    const [result] = await db.query(`
+      INSERT INTO candles 
+        (stock_id, interval_type, ts, open, high, low, close, volume, vwap, trade_count, data_source)
+      VALUES ?
+      ON DUPLICATE KEY UPDATE
+        open = VALUES(open),
+        high = VALUES(high),
+        low = VALUES(low),
+        close = VALUES(close),
+        volume = VALUES(volume),
+        vwap = VALUES(vwap),
+        trade_count = VALUES(trade_count)
+    `, [values]);
+    
+    totalInserted += result.affectedRows;
+  }
+  
+  return totalInserted;
+}
+
+async function aggregateBars(interval, multiplier) {
+  const db = getDB();
+  console.log(`  📊 Aggregating ${interval}...`);
+  
+  const lookbackSeconds = multiplier * 60 * 100;
+  const cutoffTs = Math.floor(Date.now() / 1000) - lookbackSeconds;
+  
+  const [rows] = await db.query(`
+    SELECT 
+      stock_id,
+      FLOOR(ts / ?) * ? as bucket_ts,
+      MIN(ts) as period_start,
+      MAX(ts) as period_end,
+      MAX(high) as max_high,
+      MIN(low) as min_low,
+      SUM(volume) as total_volume,
+      AVG(vwap) as avg_vwap,
+      SUM(trade_count) as total_trades
+    FROM candles
+    WHERE interval_type = '1m' AND ts >= ?
+    GROUP BY stock_id, bucket_ts
+    HAVING COUNT(*) = ?
+  `, [multiplier * 60, multiplier * 60, cutoffTs, multiplier]);
+  
+  if (rows.length === 0) return 0;
+  
+  const values = [];
+  for (const row of rows) {
+    const [ohlc] = await db.query(`
+      SELECT 
+        (SELECT open FROM candles WHERE stock_id = ? AND interval_type = '1m' AND ts >= ? AND ts <= ? ORDER BY ts ASC LIMIT 1) as open,
+        (SELECT close FROM candles WHERE stock_id = ? AND interval_type = '1m' AND ts >= ? AND ts <= ? ORDER BY ts DESC LIMIT 1) as close
+    `, [row.stock_id, row.period_start, row.period_end, row.stock_id, row.period_start, row.period_end]);
+    
+    if (ohlc.length > 0 && ohlc[0].open && ohlc[0].close) {
+      values.push([
+        row.stock_id,
+        interval,
+        row.bucket_ts,
+        ohlc[0].open,
+        row.max_high,
+        row.min_low,
+        ohlc[0].close,
+        row.total_volume,
+        row.avg_vwap,
+        row.total_trades,
+        'aggregated'
+      ]);
+    }
+  }
+  
+  if (values.length > 0) {
+    await db.query(`
+      INSERT INTO candles 
+        (stock_id, interval_type, ts, open, high, low, close, volume, vwap, trade_count, data_source)
+      VALUES ?
+      ON DUPLICATE KEY UPDATE
+        open = VALUES(open),
+        high = VALUES(high),
+        low = VALUES(low),
+        close = VALUES(close),
+        volume = VALUES(volume),
+        vwap = VALUES(vwap),
+        trade_count = VALUES(trade_count)
+    `, [values]);
+  }
+  
+  console.log(`    ✓ ${values.length} ${interval} candles`);
+  return values.length;
+}
+
+// ===== COLLECTION JOBS =====
+
+async function collect1mBars() {
+  const logId = await startLog('collect_1m', '1m', SYMBOLS.length);
+  
+  try {
+    console.log(`\n📥 [${new Date().toLocaleTimeString()}] Collecting 1m bars...`);
+    
+    const end = new Date();
+    const start = new Date(end.getTime() - 10 * 60 * 1000);
+    
+    const barsData = await fetchAlpacaBars(SYMBOLS, start, end);
+    const totalInserted = await store1mBars(barsData);
+    
+    await completeLog(logId, 'completed', Object.keys(barsData).length, totalInserted, 0);
+    
+    console.log(`✅ Collected ${totalInserted} bars from ${Object.keys(barsData).length} symbols`);
+    
+    return totalInserted;
+  } catch (error) {
+    await completeLog(logId, 'failed', 0, 0, 0, error.message);
+    console.error('❌ Collection failed:', error.message);
+    return 0;
+  }
+}
+
+async function aggregateAll() {
+  console.log(`\n📊 [${new Date().toLocaleTimeString()}] Aggregating...`);
+  
+  try {
+    await aggregateBars('5m', 5);
+    await aggregateBars('15m', 15);
+    await aggregateBars('30m', 30);
+    await aggregateBars('1h', 60);
+    await aggregateBars('4h', 240);
+    console.log('✅ Aggregation completed');
+  } catch (error) {
+    console.error('❌ Aggregation failed:', error.message);
+  }
+}
+
+async function collectDailyBars() {
+  const logId = await startLog('collect_1d', '1d', SYMBOLS.length);
+  
+  try {
+    console.log(`\n📅 [${new Date().toLocaleTimeString()}] Collecting daily bars...`);
+    
+    const end = new Date();
+    const start = new Date(end.getTime() - 5 * 24 * 60 * 60 * 1000);
+    
+    const barsData = await fetchAlpacaBars(SYMBOLS, start, end, '1Day');
+    const totalInserted = await store1mBars(barsData);
+    
+    await completeLog(logId, 'completed', Object.keys(barsData).length, totalInserted, 0);
+    console.log(`✅ Collected ${totalInserted} daily bars`);
+  } catch (error) {
+    await completeLog(logId, 'failed', 0, 0, 0, error.message);
+    console.error('❌ Daily collection failed:', error.message);
+  }
+}
+
+async function cleanupOldData() {
+  const db = getDB();
+  console.log(`\n🧹 [${new Date().toLocaleTimeString()}] Cleaning up old data...`);
+  
+  try {
+    const [result] = await db.query('CALL cleanup_old_candles()');
+    console.log(`✅ Cleanup completed: ${result[0][0].total_deleted} records deleted`);
+  } catch (error) {
+    console.error('❌ Cleanup failed:', error.message);
+  }
+}
+
+async function backfillMissingData() {
+  console.log('\n⏪ Backfilling missing data...');
+  
+  try {
+    const end = new Date();
+    const start = new Date(end.getTime() - BACKFILL_DAYS * 24 * 60 * 60 * 1000);
+    
+    console.log(`  Fetching last ${BACKFILL_DAYS} days...`);
+    const barsData = await fetchAlpacaBars(SYMBOLS, start, end);
+    const totalInserted = await store1mBars(barsData);
+    
+    console.log(`✅ Backfilled ${totalInserted} bars`);
+    
+    await aggregateAll();
+  } catch (error) {
+    console.error('❌ Backfill failed:', error.message);
+  }
+}
+
+// ===== SCHEDULER =====
+
+function startScheduler() {
+  console.log('\n⏰ Starting scheduler...\n');
+  
+  if (!COLLECTION_ENABLED) {
+    console.log('⚠️  Collection is DISABLED (set COLLECTION_ENABLED=true to enable)');
+    return;
+  }
+  
+  // Collect 1m bars every minute
+  cron.schedule('* * * * *', async () => {
+    await collect1mBars();
+  });
+  
+  // Aggregate every 5 minutes
+  cron.schedule('*/5 * * * *', async () => {
+    await aggregateAll();
+  });
+  
+  // Collect daily bars at 5 PM ET
+  cron.schedule('0 17 * * 1-5', async () => {
+    await collectDailyBars();
+  });
+  
+  // Cleanup at 2 AM daily
+  cron.schedule('0 2 * * *', async () => {
+    await cleanupOldData();
+  });
+  
+  console.log('✅ Scheduler configured:');
+  console.log('   • 1m bars: Every minute');
+  console.log('   • Aggregation: Every 5 minutes');
+  console.log('   • Daily bars: 5 PM ET (weekdays)');
+  console.log('   • Cleanup: 2 AM daily\n');
+}
+
+// ===== MAIN =====
+
+async function main() {
+  console.log('\n╔═══════════════════════════════════════════════╗');
+  console.log('║     📊 STOCK DATA COLLECTOR v1.0             ║');
+  console.log('╚═══════════════════════════════════════════════╝\n');
+  
+  if (!ALPACA_CONFIG.headers['APCA-API-KEY-ID']) {
+    console.error('❌ ALPACA_API_KEY not configured in .env');
+    console.log('\nPlease set your Alpaca API credentials:');
+    console.log('  ALPACA_API_KEY=your_key');
+    console.log('  ALPACA_API_SECRET=your_secret\n');
+    process.exit(1);
+  }
+  
+  await initDB();
+  
+  console.log('🔄 Running initial collection...\n');
+  await backfillMissingData();
+  
+  startScheduler();
+  
+  console.log('✅ Collector is running...\n');
+  console.log('Press Ctrl+C to stop\n');
+}
+
+// Handle graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('\n\n⏹️  Shutting down collector...');
+  await closeDB();
+  process.exit(0);
+});
+
+process.on('SIGTERM', async () => {
+  console.log('\n\n⏹️  Shutting down collector...');
+  await closeDB();
+  process.exit(0);
+});
+
+// Start
+if (require.main === module) {
+  main().catch(error => {
+    console.error('❌ Fatal error:', error);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  collect1mBars,
+  aggregateAll,
+  collectDailyBars,
+  fetchAlpacaBars
+};
