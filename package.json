@@ -4,13 +4,15 @@
   "description": "Real-time stock data server with Alpaca integration and MySQL caching",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js",
+    "start": "node app.js",
+    "dev": "node --watch app.js",
     "collector": "node collector.js",
     "auto-refill": "node auto-refill-checker.js",
     "refill": "node refill-low-bar-symbols.js",
     "setup": "node setup.js",
-    "test": "node test-connection.js"
+    "test": "node test-quick.js",
+    "test:batch": "node test-batch-collection.js",
+    "test:full": "node test-quick.js && node test-batch-collection.js"
   },
   "keywords": [
     "stock",

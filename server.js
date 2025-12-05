@@ -1,7 +1,8 @@
 /**
  * STOCK DATA API SERVER
  * 
- * Serves real-time stock data from MySQL cache with Alpaca fallback
+ * Serves real-time stock data from MySQL cache with multi-provider fallback
+ * Supports Schwab and Alpaca with configurable priority
  * Provides standardized OHLCV data in consistent JSON format
  */
 
@@ -9,8 +10,8 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const axios = require('axios');
 const { initDB, getDB, closeDB } = require('./config/database');
+const providerManager = require('./src/providers/ProviderManager');
 require('dotenv').config();
 
 const app = express();
@@ -42,14 +43,6 @@ app.use(express.json());
 // ===== CONFIGURATION =====
 
 const DATA_STALE_MINUTES = 24 * 60; // 24 hours - allow data to be up to 1 day old
-
-const ALPACA_CONFIG = {
-  baseURL: process.env.ALPACA_BASE_URL || 'https://data.alpaca.markets',
-  headers: {
-    'APCA-API-KEY-ID': process.env.ALPACA_API_KEY,
-    'APCA-API-SECRET-KEY': process.env.ALPACA_API_SECRET
-  }
-};
 
 // ===== HELPER FUNCTIONS =====
 
@@ -225,52 +218,19 @@ async function fetchFromMySQL(symbol, intervalParam, includeExtended = false) {
   }
 }
 
-async function fetchFromAlpaca(symbol, intervalParam, includeExtended = false) {
+async function fetchFromProvider(symbol, intervalParam, includeExtended = false) {
   const interval = normalizeInterval(intervalParam);
   const { start, end } = getTimeRangeForInterval(intervalParam);
   
-  // Map interval to Alpaca timeframe
-  const timeframeMap = {
-    '1m': '1Min',
-    '2m': '2Min',
-    '5m': '5Min',
-    '15m': '15Min',
-    '30m': '30Min',
-    '1h': '1Hour',
-    '2h': '2Hour',
-    '4h': '4Hour',
-    '1d': '1Day',
-    '1w': '1Week',
-    '1mo': '1Month'
-  };
-  
   try {
-    const params = {
-      symbols: symbol,
-      timeframe: timeframeMap[interval] || '1Day',
-      start: new Date(start * 1000).toISOString(),
-      end: new Date(end * 1000).toISOString(),
-      limit: 10000,
-      adjustment: 'split',
-      feed: 'iex'
-    };
+    const startDate = new Date(start * 1000);
+    const endDate = new Date(end * 1000);
     
-    // Only include extended hours for intraday intervals
-    if (['1m', '2m', '5m', '15m', '30m', '1h', '2h', '4h'].includes(interval)) {
-      params.feed = includeExtended ? 'sip' : 'iex';  // SIP includes extended hours
-    }
+    const result = await providerManager.fetchBars(symbol, interval, startDate, endDate, includeExtended);
     
-    const response = await axios.get('/v2/stocks/bars', {
-      baseURL: ALPACA_CONFIG.baseURL,
-      headers: ALPACA_CONFIG.headers,
-      params,
-      timeout: 10000
-    });
-    
-    const bars = response.data.bars?.[symbol];
-    
+    const bars = result.bars;
     if (!bars || bars.length === 0) {
-      throw new Error('No data returned from Alpaca');
+      throw new Error('No data returned from providers');
     }
     
     // Format response structure
@@ -306,14 +266,14 @@ async function fetchFromAlpaca(symbol, intervalParam, includeExtended = false) {
         error: null
       },
       _meta: {
-        source: 'alpaca',
+        source: result.source,
         companyName: symbol,
         requestedInterval: interval,
         appliedRange: intervalParam
       }
     };
   } catch (error) {
-    console.log(`  ⚠️  Alpaca error: ${error.message}`);
+    console.log(`  ⚠️  Provider error: ${error.message}`);
     throw error;
   }
 }
@@ -339,24 +299,15 @@ async function validateAndAddSymbol(symbol) {
       return { exists: true, stockId: existing[0].stock_id };
     }
     
-    // Validate symbol with Alpaca API
+    // Validate symbol with provider manager
     console.log(`  🔍 Validating new symbol: ${symbol}`);
-    const response = await axios.get(
-      `${ALPACA_CONFIG.baseURL}/v2/stocks/${symbol}/bars`,
-      {
-        headers: ALPACA_CONFIG.headers,
-        params: {
-          timeframe: '1Day',
-          limit: 1,
-          feed: 'iex'
-        },
-        timeout: 5000
-      }
-    );
+    const validation = await providerManager.validateSymbol(symbol);
     
-    if (!response.data.bars || response.data.bars.length === 0) {
+    if (!validation.valid) {
       throw new Error('Symbol not found or no data available');
     }
+    
+    console.log(`  ✓ Symbol validated via ${validation.provider}`);
     
     // Valid symbol - add to database
     const [result] = await db.query(
@@ -392,49 +343,34 @@ async function validateAndAddSymbol(symbol) {
     
     for (const interval of intervals) {
       try {
-        const timeframeMap = {
-          '1m': { tf: '1Min', days: 1 },
-          '5m': { tf: '5Min', days: 5 },
-          '15m': { tf: '15Min', days: 30 },
-          '1h': { tf: '1Hour', days: 90 },
-          '1d': { tf: '1Day', days: 1095 } // 3 years
+        const daysMap = {
+          '1m': 1,
+          '5m': 5,
+          '15m': 30,
+          '1h': 90,
+          '1d': 1095 // 3 years
         };
         
-        const config = timeframeMap[interval];
-        if (!config) continue;
+        const days = daysMap[interval];
+        if (!days) continue;
         
-        const startDate = new Date();
-        startDate.setDate(startDate.getDate() - config.days);
+        const startDate = new Date(endDate);
+        startDate.setDate(startDate.getDate() - days);
         
-        const histResponse = await axios.get(
-          `${ALPACA_CONFIG.baseURL}/v2/stocks/bars`,
-          {
-            headers: ALPACA_CONFIG.headers,
-            params: {
-              symbols: symbol,
-              timeframe: config.tf,
-              start: startDate.toISOString(),
-              end: endDate.toISOString(),
-              adjustment: 'split',
-              feed: 'iex',
-              limit: 10000
-            },
-            timeout: 10000
-          }
-        );
+        const result = await providerManager.fetchBars(symbol, interval, startDate, endDate, false);
+        const bars = result.bars;
         
-        const bars = histResponse.data.bars?.[symbol];
         if (bars && bars.length > 0) {
           for (const bar of bars) {
             const ts = Math.floor(new Date(bar.t).getTime() / 1000);
             await db.query(
               `INSERT IGNORE INTO candles 
                (stock_id, interval_type, ts, open, high, low, close, volume, vwap, trade_count, data_source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'alpaca')`,
-              [result.insertId, interval, ts, bar.o, bar.h, bar.l, bar.c, bar.v, bar.vw || 0, bar.n || 0]
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [result.insertId, interval, ts, bar.o, bar.h, bar.l, bar.c, bar.v, bar.vw || 0, bar.n || 0, result.source]
             );
           }
-          console.log(`  📥 Fetched ${bars.length} bars for ${interval}`);
+          console.log(`  📥 Fetched ${bars.length} bars for ${interval} from ${result.source}`);
         }
       } catch (fetchError) {
         console.log(`  ⚠️  Could not fetch ${interval} data:`, fetchError.message);
@@ -545,10 +481,10 @@ app.get('/api/stock/:symbol', async (req, res) => {
         }
       }
       
-      // Fall back to Alpaca
+      // Fall back to providers (Schwab -> Alpaca)
       try {
-        const data = await fetchFromAlpaca(upperSymbol, interval, includeExtended);
-        console.log(`  ✓ Alpaca: ${data.chart.result[0].timestamp.length} bars`);
+        const data = await fetchFromProvider(upperSymbol, interval, includeExtended);
+        console.log(`  ✓ Provider: ${data.chart.result[0].timestamp.length} bars`);
         return res.json(data);
       } catch (alpacaError) {
         console.log(`  ✗ Alpaca: ${alpacaError.message}`);
@@ -600,10 +536,10 @@ app.get('/bars', async (req, res) => {
     } catch (mysqlError) {
       console.log(`  ✗ MySQL: ${mysqlError.message}`);
       
-      // Fall back to Alpaca
+      // Fall back to providers (Schwab -> Alpaca)
       try {
-        const data = await fetchFromAlpaca(upperSymbol, range, includeExtended);
-        console.log(`  ✓ Alpaca: ${data.chart.result[0].timestamp.length} bars`);
+        const data = await fetchFromProvider(upperSymbol, range, includeExtended);
+        console.log(`  ✓ Provider: ${data.chart.result[0].timestamp.length} bars`);
         return res.json(data);
       } catch (alpacaError) {
         console.log(`  ✗ Alpaca: ${alpacaError.message}`);
@@ -673,10 +609,11 @@ app.use((req, res) => {
 async function startServer() {
   try {
     await initDB();
+    await providerManager.initialize();
     
     app.listen(PORT, () => {
       console.log('\n╔═══════════════════════════════════════════════╗');
-      console.log('║     📊 STOCK DATA SERVER v1.0                ║');
+      console.log('║     📊 STOCK DATA SERVER v2.0                ║');
       console.log('╚═══════════════════════════════════════════════╝\n');
       console.log(`✅ Server running on http://localhost:${PORT}`);
       console.log(`✅ Health check: http://localhost:${PORT}/health`);
