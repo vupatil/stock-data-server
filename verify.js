@@ -125,13 +125,28 @@ console.log('\n🔌 Checking Alpaca API...\n');
 const axios = require('axios');
 
 if (process.env.ALPACA_API_KEY && process.env.ALPACA_API_SECRET) {
-  axios.get('https://data.alpaca.markets/v2/stocks/bars', {
+  // Use data.alpaca.markets for both paper and live trading
+  // The base URL in .env might be paper-api or api.alpaca, but data is always data.alpaca.markets
+  const baseURL = 'https://data.alpaca.markets';
+  
+  if (process.env.ALPACA_API_KEY.startsWith('PK')) {
+    console.log('   ℹ️  Detected paper trading key (PK prefix)');
+  } else {
+    console.log('   ℹ️  Using live trading key');
+  }
+
+  const today = new Date();
+  const sevenDaysAgo = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
+  
+  axios.get('/v2/stocks/bars', {
+    baseURL: baseURL,
     params: {
       symbols: 'AAPL',
       timeframe: '1Day',
-      start: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString(),
-      end: new Date().toISOString(),
-      limit: 5
+      start: sevenDaysAgo.toISOString().split('T')[0],
+      end: today.toISOString().split('T')[0],
+      limit: 5,
+      feed: 'iex'  // Use IEX feed for free tier
     },
     headers: {
       'APCA-API-KEY-ID': process.env.ALPACA_API_KEY,
