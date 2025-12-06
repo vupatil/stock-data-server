@@ -69,3 +69,19 @@ CREATE TABLE IF NOT EXISTS data_collection_log (
   INDEX idx_started (started_at),
   INDEX idx_job_type (job_type)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ========================================
+-- 4. EXCLUDED SYMBOLS
+-- ========================================
+CREATE TABLE IF NOT EXISTS excluded_symbols (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  symbol VARCHAR(20) NOT NULL UNIQUE,
+  reason VARCHAR(255),                -- 'No data from provider', 'Delisted', 'Invalid ticker'
+  providers_failed TEXT,              -- Comma-separated: 'alpaca,schwab,polygon'
+  last_attempted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  retry_after TIMESTAMP NULL,         -- Next retry date (30 days from last attempt)
+  retry_count INT DEFAULT 0,          -- Number of retry attempts
+  
+  INDEX idx_symbol (symbol),
+  INDEX idx_retry (retry_after)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

@@ -48,9 +48,21 @@ cp .env.example .env
 
 ### Database Setup
 
+**Important**: This step populates ALL historical data automatically.
+
 ```bash
 node setup.js
 ```
+
+**What it does** (takes 5-10 minutes for 500 symbols):
+- Creates database and all tables
+- Reads symbols from `STOCK_SYMBOLS` in `.env`
+- Fetches ~600 candles per interval for all symbols (11 intervals)
+- Uses batch requests (50 symbols per call - Alpaca's max)
+- Tracks invalid symbols in `excluded_symbols` table
+- Runs gap detection and auto-fills missing data
+
+After completion, your database will have millions of candles ready to serve!
 
 ### Start the System
 

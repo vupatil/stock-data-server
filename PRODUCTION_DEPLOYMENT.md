@@ -86,28 +86,129 @@ MAX_CANDLES_PER_INTERVAL=600
 DATA_STALE_MINUTES=1440
 ```
 
-### 3. Initialize Database
+### 3. Initialize Database & Populate Historical Data
 
-Create the database and tables:
+**IMPORTANT**: This step populates ALL historical data for ALL symbols in `STOCK_SYMBOLS`. Make sure your `.env` has the correct symbols list.
 
 ```bash
 node setup.js
 ```
 
+**Time Required**: 10-15 minutes for 622 symbols (depends on network speed)
+
+**What It Does**:
+1. Creates database: `STOCKSENTIMENT` (or your `DB_NAME`)
+2. Creates 4 tables:
+   - `stocks` - Master symbol list
+   - `candles` - OHLCV data for all intervals
+   - `data_collection_log` - Collection monitoring
+   - `excluded_symbols` - Invalid/delisted symbols tracker
+3. Reads `STOCK_SYMBOLS` from `.env` (comma-separated list)
+4. Inserts all symbols into `stocks` table
+5. **Fetches historical data** for all 11 intervals:
+   - Priority order: 1d → 1w → 1mo → 4h → 2h → 1h → 30m → 15m → 5m → 2m → 1m
+   - ~600 candles per interval per symbol (`MAX_CANDLES_PER_INTERVAL`)
+   - Uses batch requests (50 symbols per Alpaca API call - Alpaca's maximum)
+6. Tracks failed symbols in `excluded_symbols` table
+7. Runs gap detection and auto-fills missing data
+8. Displays comprehensive statistics
+
 Expected output:
 ```
+╔═══════════════════════════════════════════════╗
+║   🗄️  DATABASE SETUP WITH DATA POPULATION   ║
+╚═══════════════════════════════════════════════╝
+
+📡 Connecting to MySQL...
 ✅ Connected to MySQL
 ✅ Database 'STOCKSENTIMENT' ready
 ✅ All tables created
-✅ Found 3 tables: candles, data_collection_log, stocks
-📈 Sample stocks: 0 (empty)
-✅ SETUP COMPLETE!
+✅ Found 4 tables:
+   • stocks
+   • candles
+   • data_collection_log
+   • excluded_symbols
+
+╔═══════════════════════════════════════════════╗
+║   📊 POPULATING HISTORICAL DATA              ║
+╚═══════════════════════════════════════════════╝
+
+📈 Found 500 symbols to populate
+📦 Max candles per interval: 600
+🔄 Batch size: 100 symbols per request
+
+📝 Inserting symbols into stocks table...
+✅ 500 symbols inserted
+
+📦 Split into 5 batches
+
+═══════════════════════════════════════════════════
+📊 Collecting 1d interval (1Day)
+═══════════════════════════════════════════════════
+
+📦 [1/5] Processing batch: AAPL, TSLA, MSFT, GOOGL...
+   Symbols: 100, Requesting ~600 candles each
+   ✓ AAPL: 600 bars stored
+   ✓ TSLA: 587 bars stored
+   ⚠️  INVALID_TICKER: No data returned
+   ...
+   📊 Batch complete: 98/100 symbols
+
+✅ 1d complete: 485 successful, 15 failed
+
+[... continues for all intervals ...]
+
+╔═══════════════════════════════════════════════╗
+║   📊 DATA POPULATION SUMMARY                 ║
+╚═══════════════════════════════════════════════╝
+
+Total symbols processed: 500
+✅ Successful: 485 symbols
+❌ Failed: 15 symbols
+
+Breakdown by interval:
+  1d    → ✓ 485  ✗ 15
+  1w    → ✓ 485  ✗ 0
+  1mo   → ✓ 485  ✗ 0
+  ...
+
+⚠️  Failed symbols: INVALID1, DELISTED2, ...
+   These have been added to 'excluded_symbols' table
+   They will be retried in 30 days automatically
+
+╔═══════════════════════════════════════════════╗
+║   🔍 GAP DETECTION AND FILLING               ║
+╚═══════════════════════════════════════════════╝
+
+🔍 Checking for gaps in collected data...
+
+📊 Checking 1d interval...
+   ✅ No gaps found
+
+✅ Gap detection complete: 0 potential gaps checked
+
+╔═══════════════════════════════════════════════╗
+║   ✅ SETUP COMPLETE!                         ║
+╚═══════════════════════════════════════════════╝
+
+📊 Database Statistics:
+   • Stocks: 500
+   • Candles: 3,300,000
+   • Excluded symbols: 15
 ```
 
-This creates:
-- `stocks` table (empty - will be populated on-demand)
-- `candles` table (empty - will be filled as symbols are requested)
-- `data_collection_log` table (tracks collection jobs)
+**Key Features**:
+- ✅ Batch processing (50 symbols per request - Alpaca's limit)
+- ✅ Automatic invalid symbol exclusion
+- ✅ Gap detection and auto-filling
+- ✅ 30-day auto-retry for excluded symbols
+- ✅ Multi-provider ready (Alpaca, Schwab, Polygon)
+- ✅ Comprehensive progress logging
+
+**After Setup**:
+- Your database will have ~4.1 million candles (622 symbols × 11 intervals × 600 candles)
+- Collector will automatically exclude invalid symbols from future collections
+- No need to manually populate symbols - everything is ready to go!
 
 ### 4. Verify Configuration
 

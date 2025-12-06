@@ -37,18 +37,45 @@ This installs:
 - cors, helmet (security)
 - dotenv (config)
 
-## Step 4: Setup Database
+## Step 4: Setup Database & Populate Historical Data
 
-Make sure MySQL is running, then:
+Make sure MySQL is running and `STOCK_SYMBOLS` is set in `.env`, then:
 
 ```bash
 node setup.js
 ```
 
-This creates:
-- Database: `STOCKSENTIMENT`
-- Tables: `stocks`, `candles`, `data_collection_log`
-- Indexes for fast queries
+**This will take 5-10 minutes for 500 symbols** and:
+1. Create database and all tables (including `excluded_symbols`)
+2. Insert all symbols from `STOCK_SYMBOLS` env variable
+3. Fetch ~600 candles per interval for each symbol (11 intervals total)
+4. Use batch requests of 50 symbols to Alpaca API (Alpaca's max per request)
+5. Track symbols with no data in `excluded_symbols` table
+6. Run gap detection and fill any missing data
+7. Display detailed progress and statistics
+
+Expected output:
+```
+╔═══════════════════════════════════════════════╗
+║   📊 POPULATING HISTORICAL DATA              ║
+╚═══════════════════════════════════════════════╝
+
+📈 Found 500 symbols to populate
+📦 Batch size: 100 symbols per request
+
+📊 Collecting 1d interval...
+  [1/5] Processing batch: AAPL, TSLA, MSFT...
+  ✓ AAPL: 600 bars stored
+  ✓ TSLA: 587 bars stored
+  ...
+
+✅ Setup complete!
+   • Stocks: 500
+   • Candles: 3,300,000
+   • Excluded symbols: 15
+```
+
+**Note**: Symbols that return no data from Alpaca are added to `excluded_symbols` and automatically excluded from future collections. They will be retried after 30 days.
 
 ## Step 5: Test Connection
 

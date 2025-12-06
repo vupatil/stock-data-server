@@ -12,7 +12,8 @@
     "setup": "node setup.js",
     "test": "node test-quick.js",
     "test:batch": "node test-batch-collection.js",
-    "test:full": "node test-quick.js && node test-batch-collection.js"
+    "test:processor": "node test-batch-processor.js",
+    "test:full": "node test-quick.js && node test-batch-collection.js && node test-batch-processor.js"
   },
   "keywords": [
     "stock",

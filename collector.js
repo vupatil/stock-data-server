@@ -11,6 +11,7 @@
 const axios = require('axios');
 const cron = require('node-cron');
 const { initDB, getDB, closeDB } = require('./config/database');
+const { processBatchedSymbols, ALPACA_BATCH_SIZE } = require('./src/utils/batchProcessor');
 require('dotenv').config();
 
 // ===== CONFIGURATION =====
@@ -23,9 +24,36 @@ const ALPACA_CONFIG = {
   }
 };
 
-const SYMBOLS = process.env.STOCK_SYMBOLS 
-  ? process.env.STOCK_SYMBOLS.split(',').map(s => s.trim())
-  : ['AAPL', 'TSLA', 'MSFT', 'GOOGL', 'AMZN'];
+// Load symbols and filter out excluded ones
+async function getValidSymbols() {
+  const configSymbols = process.env.STOCK_SYMBOLS 
+    ? process.env.STOCK_SYMBOLS.split(',').map(s => s.trim())
+    : ['AAPL', 'TSLA', 'MSFT', 'GOOGL', 'AMZN'];
+  
+  try {
+    const db = getDB();
+    
+    // Get excluded symbols (that haven't reached retry_after date)
+    const [excluded] = await db.query(`
+      SELECT symbol FROM excluded_symbols 
+      WHERE retry_after IS NULL OR retry_after > NOW()
+    `);
+    
+    const excludedSet = new Set(excluded.map(row => row.symbol));
+    const validSymbols = configSymbols.filter(s => !excludedSet.has(s));
+    
+    if (excludedSet.size > 0) {
+      console.log(`⚠️  Excluding ${excludedSet.size} invalid symbols from collection`);
+    }
+    
+    return validSymbols;
+  } catch (error) {
+    // If DB not ready or table doesn't exist, return all symbols
+    console.log(`⚠️  Could not check excluded symbols, using all configured symbols`);
+    return configSymbols;
+  }
+}
+
 
 const COLLECTION_ENABLED = process.env.COLLECTION_ENABLED !== 'false';
 const MAX_CANDLES = parseInt(process.env.MAX_CANDLES_PER_INTERVAL) || 600;
@@ -49,7 +77,8 @@ const INTERVALS = [
   { name: '1mo', cron: '0 16 28-31 * *', alpaca: '1Month', minutes: 43200 } // Last day check
 ];
 
-console.log(`\n📊 Collector configured for ${SYMBOLS.length} symbols`);
+// Log initial configuration (will show actual count after getValidSymbols() is called)
+console.log(`\n📊 Collector starting...`);
 console.log(`   Max candles per interval: ${MAX_CANDLES}`);
 console.log(`   Extended hours: ${EXTENDED_HOURS ? 'Yes' : 'No'}`);
 
@@ -283,7 +312,8 @@ function isMarketHours() {
 }
 
 async function collectInterval(intervalConfig) {
-  const logId = await startLog(`collect_${intervalConfig.name}`, intervalConfig.name, SYMBOLS.length);
+  const validSymbols = await getValidSymbols();
+  const logId = await startLog(`collect_${intervalConfig.name}`, intervalConfig.name, validSymbols.length);
   
   try {
     // Skip intraday collection outside market hours
@@ -294,20 +324,36 @@ async function collectInterval(intervalConfig) {
       return 0;
     }
     
-    console.log(`\n📥 [${new Date().toLocaleTimeString()}] Collecting ${intervalConfig.name} bars...`);
+    console.log(`\n📥 [${new Date().toLocaleTimeString()}] Collecting ${intervalConfig.name} bars for ${validSymbols.length} symbols...`);
     
     // Fetch last few periods to ensure we don't miss any
     const lookbackPeriods = 10;
     const end = new Date();
     const start = new Date(end.getTime() - (lookbackPeriods * intervalConfig.minutes * 60 * 1000));
     
-    // 🔥 ONE BATCH REQUEST FOR ALL SYMBOLS!
-    const barsData = await fetchAlpacaBars(SYMBOLS, start, end, intervalConfig.alpaca);
-    const totalInserted = await storeBars(barsData, intervalConfig.name);
+    let totalInserted = 0;
+    let symbolsProcessed = 0;
     
-    await completeLog(logId, 'completed', Object.keys(barsData).length, totalInserted, 0);
+    // Use centralized batch processor
+    await processBatchedSymbols(
+      validSymbols,
+      async (batch) => {
+        const barsData = await fetchAlpacaBars(batch, start, end, intervalConfig.alpaca);
+        const inserted = await storeBars(barsData, intervalConfig.name);
+        totalInserted += inserted;
+        symbolsProcessed += Object.keys(barsData).length;
+        return { success: true, processedCount: batch.length };
+      },
+      {
+        batchSize: ALPACA_BATCH_SIZE,
+        delayBetweenBatches: 500,
+        silent: true
+      }
+    );
     
-    console.log(`✅ Collected ${totalInserted} ${intervalConfig.name} bars from ${Object.keys(barsData).length} symbols`);
+    await completeLog(logId, 'completed', symbolsProcessed, totalInserted, 0);
+    
+    console.log(`✅ Collected ${totalInserted} ${intervalConfig.name} bars from ${symbolsProcessed} symbols`);
     
     return totalInserted;
   } catch (error) {
@@ -322,6 +368,8 @@ async function collectInterval(intervalConfig) {
 async function fillAllGaps() {
   console.log('\n🔍 Checking for gaps across all intervals...\n');
   
+  const validSymbols = await getValidSymbols();
+  
   // Fill in priority order (daily/weekly first, then intraday)
   for (const intervalName of GAP_FILL_PRIORITY) {
     const intervalConfig = INTERVALS.find(i => i.name === intervalName);
@@ -331,7 +379,7 @@ async function fillAllGaps() {
     
     // Check which symbols need data
     const symbolsNeedingData = [];
-    for (const symbol of SYMBOLS) {
+    for (const symbol of validSymbols) {
       const gapInfo = await detectGaps(symbol, intervalConfig);
       if (gapInfo.hasGaps) {
         symbolsNeedingData.push(symbol);
@@ -344,17 +392,33 @@ async function fillAllGaps() {
     }
     
     console.log(`🔍 Found ${symbolsNeedingData.length} symbols needing data`);
-    console.log(`📥 Fetching ALL symbols in ONE batch request...`);
+    console.log(`📥 Fetching in batches of ${ALPACA_BATCH_SIZE}...`);
     
-    // Fetch ALL symbols in ONE batch request!
+    // Use centralized batch processor
     try {
       const start = new Date(Date.now() - MAX_CANDLES * intervalConfig.minutes * 60 * 1000);
       const end = new Date();
       
-      const barsData = await fetchAlpacaBars(symbolsNeedingData, start, end, intervalConfig.alpaca);
-      const totalFilled = await storeBars(barsData, intervalConfig.name);
+      let totalFilled = 0;
+      let symbolsProcessed = 0;
       
-      console.log(`✅ ${intervalConfig.name}: Filled ${totalFilled} candles for ${Object.keys(barsData).length} symbols\n`);
+      await processBatchedSymbols(
+        symbolsNeedingData,
+        async (batch) => {
+          const barsData = await fetchAlpacaBars(batch, start, end, intervalConfig.alpaca);
+          const filled = await storeBars(barsData, intervalConfig.name);
+          totalFilled += filled;
+          symbolsProcessed += Object.keys(barsData).length;
+          return { success: true, processedCount: batch.length };
+        },
+        {
+          batchSize: ALPACA_BATCH_SIZE,
+          delayBetweenBatches: 500,
+          silent: true
+        }
+      );
+      
+      console.log(`✅ ${intervalConfig.name}: Filled ${totalFilled} candles for ${symbolsProcessed} symbols\n`);
     } catch (error) {
       console.error(`❌ ${intervalConfig.name}: Batch fill failed:`, error.message);
     }
@@ -366,10 +430,12 @@ async function fillAllGaps() {
 async function cleanupAllData() {
   console.log('\n🧹 Cleaning up old data...\n');
   
+  const validSymbols = await getValidSymbols();
+  
   for (const intervalConfig of INTERVALS) {
     let totalDeleted = 0;
     
-    for (const symbol of SYMBOLS) {
+    for (const symbol of validSymbols) {
       const deleted = await cleanupOldData(symbol, intervalConfig.name);
       totalDeleted += deleted;
     }
@@ -424,6 +490,16 @@ async function main() {
   }
   
   await initDB();
+  
+  // Load valid symbols (excluding excluded_symbols)
+  const validSymbols = await getValidSymbols();
+  console.log(`\n📊 Collector configured for ${validSymbols.length} symbols`);
+  console.log(`   Max candles per interval: ${MAX_CANDLES}`);
+  console.log(`   Extended hours: ${EXTENDED_HOURS ? 'Yes' : 'No'}`);
+  
+  // Update SYMBOLS constant with valid symbols
+  SYMBOLS.length = 0;
+  SYMBOLS.push(...validSymbols);
   
   console.log('🔄 Running initial gap fill...\n');
   await fillAllGaps();

@@ -36,12 +36,54 @@ async function dropAndRecreate() {
   
   // Now run setup
   console.log('🔧 Running setup to recreate tables...\n');
-  const { exec } = require('child_process');
-  const util = require('util');
-  const execPromise = util.promisify(exec);
+  const { spawn } = require('child_process');
   
-  await execPromise('node setup.js');
-  console.log('\n✅ Complete! Tables recreated with updated schema.\n');
+  const setupProcess = spawn('node', ['setup.js'], {
+    stdio: 'inherit', // This passes through all output to parent process
+    shell: true
+  });
+  
+  setupProcess.on('close', async (code) => {
+    if (code === 0) {
+      // Reconnect to get final statistics
+      const statsConnection = await mysql.createConnection({
+        host: process.env.DB_HOST || 'localhost',
+        port: process.env.DB_PORT || 3306,
+        user: process.env.DB_USER || 'root',
+        password: process.env.DB_PASSWORD,
+        database: process.env.DB_NAME || 'STOCKSENTIMENT'
+      });
+      
+      const [stockCount] = await statsConnection.query('SELECT COUNT(*) as count FROM stocks');
+      const [excludedCount] = await statsConnection.query('SELECT COUNT(*) as count FROM excluded_symbols');
+      const [candleCount] = await statsConnection.query('SELECT COUNT(*) as count FROM candles');
+      
+      const successfulSymbols = stockCount[0].count - excludedCount[0].count;
+      const failedSymbols = excludedCount[0].count;
+      
+      await statsConnection.end();
+      
+      console.log('\n╔═══════════════════════════════════════════════╗');
+      console.log('║   🎉 DROP & SETUP COMPLETED!                 ║');
+      console.log('╚═══════════════════════════════════════════════╝\n');
+      
+      console.log('📊 Final Results:');
+      console.log(`   ✅ Successfully loaded: ${successfulSymbols} symbols`);
+      console.log(`   ❌ Failed to load: ${failedSymbols} symbols`);
+      console.log(`   📈 Total candles stored: ${candleCount[0].count.toLocaleString()}`);
+      console.log(`   💾 Average candles per symbol: ${successfulSymbols > 0 ? Math.round(candleCount[0].count / successfulSymbols).toLocaleString() : 0}\n`);
+      
+      if (failedSymbols > 0) {
+        console.log('ℹ️  Failed symbols have been recorded in the excluded_symbols table');
+        console.log('   They will be retried automatically after 30 days.\n');
+      }
+      
+      console.log('✅ Database is ready! You can now start the server.\n');
+    } else {
+      console.error(`\n❌ Setup failed with exit code ${code}\n`);
+      process.exit(code);
+    }
+  });
 }
 
 dropAndRecreate().catch(console.error);

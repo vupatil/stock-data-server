@@ -17,6 +17,7 @@ const helmet = require('helmet');
 const cron = require('node-cron');
 const { initDB, getDB, closeDB } = require('./config/database');
 const providerManager = require('./src/providers/ProviderManager');
+const { processBatchedSymbols, ALPACA_BATCH_SIZE } = require('./src/utils/batchProcessor');
 require('dotenv').config();
 
 const app = express();
@@ -387,10 +388,16 @@ async function fetchFromMySQL(symbol, intervalParam, includeExtended = false) {
       staleThreshold = 4 * 24 * 60; // 4 days for daily data
     }
     
-    // If market is closed, be more lenient with staleness
+    // If market is closed, be more lenient with staleness for intraday data
     if (!isMarketHours()) {
-      // After market close, data can be up to 24 hours old
-      staleThreshold = Math.max(staleThreshold, 24 * 60);
+      // After market close, allow data to be old until next market open
+      // Check if latest candle is from a recent market day (within 4 days)
+      const intradayIntervals = ['1m', '2m', '5m', '15m', '30m', '1h', '2h', '4h'];
+      if (intradayIntervals.includes(interval)) {
+        staleThreshold = 4 * 24 * 60; // 4 days (covers weekend)
+      } else {
+        staleThreshold = Math.max(staleThreshold, 24 * 60);
+      }
     }
     
     if (ageMinutes > staleThreshold) {
@@ -797,8 +804,8 @@ async function collectInterval(intervalName) {
     const startDate = new Date(Date.now() - daysBack * 24 * 60 * 60 * 1000).toISOString();
     console.log(`  📅 Date range: ${startDate} to ${endDate} (${daysBack} days)`);
     
-    // Split into chunks of 100 symbols (Alpaca has batch size limits)
-    const BATCH_SIZE = 100;
+    // Split into chunks of 50 symbols (Alpaca returns max 50 symbols per request)
+    const BATCH_SIZE = 50;
     const chunks = [];
     for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
       chunks.push(symbols.slice(i, i + BATCH_SIZE));
@@ -1016,8 +1023,8 @@ async function processCollectionQueue() {
       
       console.log(`\n  🔄 ${intervalName}: Collecting ${symbols.length} symbols...`);
       
-      // Split into chunks of 100 symbols (Alpaca has batch size limits)
-      const BATCH_SIZE = 100;
+      // Split into chunks of 50 symbols (Alpaca returns max 50 symbols per request)
+      const BATCH_SIZE = 50;
       const chunks = [];
       for (let i = 0; i < symbols.length; i += BATCH_SIZE) {
         chunks.push(symbols.slice(i, i + BATCH_SIZE));
