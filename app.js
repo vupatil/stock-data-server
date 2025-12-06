@@ -460,11 +460,12 @@ async function queueSymbolForCollection(symbol) {
   
   // Validate with provider (but don't fetch data)
   console.log(`  🔍 Validating symbol ${symbol} with provider...`);
-  const isValid = await providerManager.validateSymbol(symbol);
+  const validation = await providerManager.validateSymbol(symbol);
   
-  if (!isValid) {
+  if (!validation.valid) {
     throw new Error(`Symbol ${symbol} not found by any provider`);
   }
+  console.log(`  ✓ Validated by ${validation.provider}`);
   
   // Add to stocks table
   const [result] = await db.query(
